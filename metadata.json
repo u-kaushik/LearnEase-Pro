@@ -1,0 +1,6 @@
+{
+  "name": "LearnEase Pro - PERFECT LEARN LMS",
+  "description": "Comprehensive MERN stack eLearning management system for students, faculties, and administrators with course management, access requests, video and material viewer, ratings, and group chats.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

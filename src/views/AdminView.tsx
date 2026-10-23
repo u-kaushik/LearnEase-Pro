@@ -387,6 +387,19 @@ export const AdminView: React.FC<AdminViewProps> = ({
                               <option value="presentation">Presentation Slides</option>
                               <option value="document">Documentation & PDF</option>
                             </select>
+                            <label className="block text-xs mt-2">Material URL
+                              <input aria-label="Material URL" value={ch.materialUrl} className="w-full border p-2 rounded" onChange={e => setChapters(chapters.map((item, i) => i === idx ? { ...item, materialUrl: e.target.value } : item))} />
+                            </label>
+                            <label className="block text-xs mt-2">Upload document or presentation (PDF, max 500 KB)
+                              <input aria-label="Upload learning material" type="file" accept="application/pdf" onChange={e => {
+                                const file = e.target.files?.[0];
+                                if (!file) return;
+                                if (file.type !== 'application/pdf' || file.size > 500000) { alert('Use a PDF up to 500 KB. For larger files and videos, use a hosted URL.'); return; }
+                                const reader = new FileReader();
+                                reader.onload = () => setChapters(prev => prev.map((item, i) => i === idx ? { ...item, materialUrl: String(reader.result), materialTitle: file.name, materialType: 'document' } : item));
+                                reader.readAsDataURL(file);
+                              }} />
+                            </label>
                           </div>
                         </div>
                       </div>

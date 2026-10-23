@@ -26,24 +26,10 @@ function LMSApp() {
   const [isChangePasswordOpen, setIsChangePasswordOpen] = useState(false);
   const [loading, setLoading] = useState(true);
 
-  // Synchronize default tab on role changes
+  // Each signed-in role starts on its own valid landing page.
   useEffect(() => {
-    if (!user) {
-      setCurrentTab('home');
-    } else if (role === 'admin') {
-      if (['requestcourse', 'viewrequest', 'owncourse', 'home'].includes(currentTab)) {
-        setCurrentTab('addcourse'); // match Slide 12
-      }
-    } else if (role === 'student') {
-      if (['addcourse', 'facultydetails', 'studentdetails', 'updatecourse', 'home'].includes(currentTab)) {
-        setCurrentTab('requestcourse'); // match Slide 13
-      }
-    } else if (role === 'faculty') {
-      if (['addcourse', 'requestcourse', 'viewrequest', 'owncourse', 'home'].includes(currentTab)) {
-        setCurrentTab('coursedetails');
-      }
-    }
-  }, [role, user]);
+    setCurrentTab(!user ? 'home' : role === 'admin' ? 'addcourse' : role === 'faculty' ? 'coursedetails' : 'requestcourse');
+  }, [role, user?.id]);
 
   const fetchData = async () => {
     try {
@@ -65,7 +51,7 @@ function LMSApp() {
 
   useEffect(() => {
     fetchData();
-  }, []);
+  }, [user?.id]);
 
   const handleResetDemoData = async () => {
     if (!confirm('Reset all courses, users, and requests to default sample data?')) return;

@@ -1,4 +1,7 @@
+import 'dotenv/config';
 import express from 'express';
+import mongoose from 'mongoose';
+import { randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 import { createServer as createViteServer } from 'vite';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -487,19 +490,121 @@ const INITIAL_PROGRESS: Record<string, { completedChapterIds: string[]; complete
   },
 };
 
-// State Store
-let users: ServerUser[] = [...INITIAL_USERS];
-let courses = [...INITIAL_COURSES];
-let requests = [...INITIAL_REQUESTS];
-let reviews = [...INITIAL_REVIEWS];
-let chats = [...INITIAL_CHATS];
-let progressStore = { ...INITIAL_PROGRESS };
+// One atomic MongoDB document stores the teaching dataset. Requests are serialized
+// in this single-process capstone so a successful response always follows persistence.
+const stateSchema = new mongoose.Schema({
+  _id: String,
+  users: [mongoose.Schema.Types.Mixed], courses: [mongoose.Schema.Types.Mixed],
+  requests: [mongoose.Schema.Types.Mixed], reviews: [mongoose.Schema.Types.Mixed],
+  chats: [mongoose.Schema.Types.Mixed], progress: mongoose.Schema.Types.Mixed,
+}, { versionKey: false });
+const LearningState = mongoose.model('LearningState', stateSchema);
+const hashPassword = (password: string) => {
+  const salt = randomBytes(16).toString('hex');
+  return `${salt}:${scryptSync(password, salt, 64).toString('hex')}`;
+};
+const verifyPassword = (password: string, stored: string) => {
+  const [salt, hash] = stored.split(':');
+  if (!salt || !hash) return false;
+  const expected = Buffer.from(hash, 'hex');
+  const actual = scryptSync(password, salt, 64);
+  return expected.length === actual.length && timingSafeEqual(expected, actual);
+};
+const freshUsers = () => INITIAL_USERS.map(u => ({ ...u, password: hashPassword(u.password) }));
+let users: ServerUser[] = freshUsers();
+let courses = structuredClone(INITIAL_COURSES);
+let requests = structuredClone(INITIAL_REQUESTS);
+let reviews = structuredClone(INITIAL_REVIEWS);
+let chats = structuredClone(INITIAL_CHATS);
+let progressStore: Record<string, { completedChapterIds: string[]; completedMaterialIds: string[] }> = structuredClone(INITIAL_PROGRESS);
+const sessions = new Map<string, { userId: string; expires: number }>();
+const saveState = () => LearningState.replaceOne({ _id: 'capstone' }, {
+  _id: 'capstone', users, courses, requests, reviews, chats, progress: progressStore,
+}, { upsert: true });
 
 async function startServer() {
   const app = express();
   const PORT = process.env.PORT || 3000;
 
-  app.use(express.json());
+  if (process.env.DEMO_MONGO === 'true') {
+    const { MongoMemoryServer } = await import('mongodb-memory-server');
+    const mongo = await MongoMemoryServer.create();
+    await mongoose.connect(mongo.getUri());
+    console.log('Temporary MongoDB demo: data resets when this process stops.');
+  } else {
+    await mongoose.connect(process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/learnease');
+  }
+  const saved = await LearningState.findById('capstone').lean();
+  if (saved) {
+    users = saved.users as ServerUser[];
+    courses = saved.courses as typeof courses;
+    requests = saved.requests as typeof requests;
+    reviews = saved.reviews as typeof reviews;
+    chats = saved.chats as typeof chats;
+    progressStore = saved.progress;
+  } else await saveState();
+  app.use(express.json({ limit: '1mb' }));
+  let queue = Promise.resolve();
+  app.use('/api', async (req, res, next) => {
+    let release!: () => void;
+    const previous = queue;
+    queue = new Promise<void>(resolve => { release = resolve; });
+    await previous;
+    let released = false;
+    const done = () => { if (!released) { released = true; release(); } };
+    res.on('finish', done);
+    res.on('close', done);
+    const originalJson = res.json.bind(res);
+    res.json = ((data: unknown) => {
+      if (req.method === 'GET' || res.statusCode >= 400) return originalJson(data);
+      void saveState().then(() => originalJson(data)).catch(() => {
+        res.status(503);
+        originalJson({ error: 'Database write failed; restart the server before continuing.' });
+      });
+      return res;
+    }) as typeof res.json;
+    next();
+  });
+  app.use('/api', (req, res, next) => {
+    if (['/auth/login', '/auth/register'].includes(req.path)) return next();
+    if (req.method === 'GET' && (req.path === '/courses' || req.path.startsWith('/courses/'))) return next();
+    const token = req.headers.cookie?.split('; ').find(c => c.startsWith('learnease_session='))?.split('=')[1];
+    const session = token ? sessions.get(token) : undefined;
+    const actor = session && session.expires > Date.now() ? users.find(u => u.id === session.userId) : undefined;
+    if (!actor) return res.status(401).json({ error: 'Please sign in.' });
+    const admin = actor.role === 'admin';
+    const forbidden = () => res.status(403).json({ error: 'Not permitted for this account.' });
+    if (req.path === '/users') {
+      if (!admin) req.query.role = actor.role;
+    }
+    if (req.path === '/reset-demo' && !admin) return forbidden();
+    if (req.path.startsWith('/courses') && req.method !== 'GET') {
+      if (!admin && actor.role !== 'faculty') return forbidden();
+      const course = courses.find(c => c.id === req.path.split('/')[2]);
+      if (!admin && (req.method === 'DELETE' || (course && course.facultyId !== actor.id))) return forbidden();
+      if (!admin) { req.body.facultyId = actor.id; req.body.facultyName = actor.name; }
+    }
+    if (req.path === '/requests' && req.method === 'GET' && !admin) return forbidden();
+    if (req.path.startsWith('/requests/') && req.method === 'PUT' && !admin) return forbidden();
+    if (req.path.startsWith('/requests/student/') && !admin && req.path.split('/')[3] !== actor.id) return forbidden();
+    if (req.path === '/requests' && req.method === 'POST') {
+      if (actor.role !== 'student') return forbidden();
+      Object.assign(req.body, { studentId: actor.id, studentName: actor.name, studentEmail: actor.email });
+    }
+    if (req.path === '/reviews' && req.method === 'POST') {
+      if (actor.role !== 'student' || !actor.enrolledCourseIds?.includes(req.body.courseId)) return forbidden();
+      if (!Number.isInteger(Number(req.body.rating)) || req.body.rating < 1 || req.body.rating > 5) return res.status(400).json({ error: 'Rating must be 1 to 5.' });
+      Object.assign(req.body, { userId: actor.id, userName: actor.name });
+    }
+    if (req.path.startsWith('/chat/') && req.method === 'POST') Object.assign(req.body, { userId: actor.id, userName: actor.name, userRole: actor.role });
+    if (req.path === '/auth/change-password' && req.body.userId !== actor.id) return forbidden();
+    if (req.path.startsWith('/progress')) {
+      const id = req.method === 'GET' ? req.path.split('/')[2] : req.body.studentId;
+      const courseId = req.method === 'GET' ? req.path.split('/')[3] : req.body.courseId;
+      if (!admin && (id !== actor.id || !actor.enrolledCourseIds?.includes(courseId))) return forbidden();
+    }
+    next();
+  });
 
   // ---------------- AUTHENTICATION & USERS ---------------- //
   app.post('/api/auth/login', (req, res) => {
@@ -510,7 +615,7 @@ async function startServer() {
 
     const normalizedEmail = email.trim().toLowerCase();
     const user = users.find(
-      (u) => u.email.toLowerCase() === normalizedEmail && u.password === password
+      (u) => u.email.toLowerCase() === normalizedEmail && verifyPassword(password, u.password)
     );
 
     if (!user) {
@@ -523,6 +628,9 @@ async function startServer() {
       });
     }
 
+    const token = randomBytes(32).toString('hex');
+    sessions.set(token, { userId: user.id, expires: Date.now() + 8 * 60 * 60 * 1000 });
+    res.cookie('learnease_session', token, { httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', maxAge: 8 * 60 * 60 * 1000 });
     // Return safe user without password
     const { password: _, ...safeUser } = user;
     return res.json({ success: true, user: safeUser });
@@ -534,6 +642,7 @@ async function startServer() {
       return res.status(400).json({ error: 'Name, email, password, and role are required' });
     }
 
+    if (!['student', 'faculty'].includes(role)) return res.status(400).json({ error: 'Invalid registration role.' });
     const normalizedEmail = email.trim().toLowerCase();
     if (users.some((u) => u.email.toLowerCase() === normalizedEmail)) {
       return res.status(409).json({ error: 'User with this email already exists' });
@@ -543,7 +652,7 @@ async function startServer() {
       id: `u-${Date.now()}`,
       name: name.trim(),
       email: normalizedEmail,
-      password: password,
+      password: hashPassword(password),
       role: role as 'student' | 'faculty',
       department: department?.trim() || (role === 'faculty' ? 'Computer Science & Tech' : 'Undergraduate Engineering'),
       avatar: `https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80`,
@@ -553,6 +662,9 @@ async function startServer() {
     };
 
     users.push(newUser);
+    const token = randomBytes(32).toString('hex');
+    sessions.set(token, { userId: newUser.id, expires: Date.now() + 8 * 60 * 60 * 1000 });
+    res.cookie('learnease_session', token, { httpOnly: true, sameSite: 'strict', secure: process.env.NODE_ENV === 'production', maxAge: 8 * 60 * 60 * 1000 });
     const { password: _, ...safeUser } = newUser;
     return res.status(201).json({ success: true, user: safeUser });
   });
@@ -563,10 +675,10 @@ async function startServer() {
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
-    if (user.password !== oldPassword) {
+    if (!verifyPassword(oldPassword, user.password)) {
       return res.status(400).json({ error: 'Current password does not match' });
     }
-    user.password = newPassword;
+    user.password = hashPassword(newPassword);
     return res.json({ success: true, message: 'Password updated successfully' });
   });
 
@@ -846,7 +958,7 @@ async function startServer() {
 
   // ---------------- RESET DEMO DATA ---------------- //
   app.post('/api/reset-demo', (req, res) => {
-    users = JSON.parse(JSON.stringify(INITIAL_USERS));
+    users = freshUsers();
     courses = JSON.parse(JSON.stringify(INITIAL_COURSES));
     requests = JSON.parse(JSON.stringify(INITIAL_REQUESTS));
     reviews = JSON.parse(JSON.stringify(INITIAL_REVIEWS));
@@ -869,7 +981,7 @@ async function startServer() {
     app.use(vite.middlewares);
   }
 
-  app.listen(Number(PORT), '0.0.0.0', () => {
+  app.listen(Number(PORT), process.env.HOST || '127.0.0.1', () => {
     console.log(`LearnEase Pro / PERFECT LEARN Server running on port ${PORT}`);
   });
 }

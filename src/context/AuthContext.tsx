@@ -24,17 +24,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return null;
       }
     }
-    // Default initial user is Ajay (Student) matching Slide 13 screenshot
-    return {
-      id: 'u-stud-1',
-      name: 'ajay',
-      email: 'ajay@gmail.com',
-      role: 'student' as UserRole,
-      department: 'Computer Science & Engineering',
-      avatar: 'https://images.unsplash.com/photo-1535713875002-d1d0cf377fde?w=150&auto=format&fit=crop&q=80',
-      joinedDate: '2024-04-12',
-      enrolledCourseIds: ['c-1'],
-    };
+    return null;
   });
 
   useEffect(() => {

@@ -1,0 +1,20 @@
+import assert from 'node:assert/strict';
+const base=process.env.BASE_URL || 'http://127.0.0.1:3000';
+async function call(path, method='GET', body, cookie='') {const r=await fetch(base+'/api'+path,{method,headers:{'Content-Type':'application/json',Cookie:cookie},body:body?JSON.stringify(body):undefined});return {status:r.status,data:await r.json(),cookie:r.headers.get('set-cookie')?.split(';')[0]};}
+assert.equal((await call('/users')).status,401);
+let a=await call('/auth/login','POST',{email:'admin@gmail.com',password:'admin'});assert.equal(a.status,200);
+let f=await call('/auth/login','POST',{email:'faculty@gmail.com',password:'faculty'});assert.equal(f.status,200);
+let st=await call('/auth/login','POST',{email:'ajay@gmail.com',password:'student'});assert.equal(st.status,200);
+assert.equal((await call('/courses','POST',{name:'Forbidden'},st.cookie)).status,403);
+assert.equal((await call('/auth/register','POST',{name:'x',email:'x@test.invalid',password:'password',role:'admin'})).status,400);
+const course=await call('/courses','POST',{name:'Assessment Verification',facultyId:'u-fac-1',chapters:[]},a.cookie);assert.equal(course.status,201);
+assert.equal((await call('/courses/'+course.data.id,'PUT',{description:'Faculty updated'},f.cookie)).status,200);
+const req=await call('/requests','POST',{courseId:course.data.id,courseName:course.data.name},st.cookie);assert.equal(req.status,201);
+assert.equal((await call('/requests/'+req.data.id,'PUT',{status:'Approved'},st.cookie)).status,403);
+assert.equal((await call('/requests/'+req.data.id,'PUT',{status:'Approved'},a.cookie)).status,200);
+assert.equal((await call('/progress','POST',{studentId:'u-stud-1',courseId:course.data.id,chapterId:'test',completed:true},st.cookie)).status,200);
+assert.equal((await call('/reviews','POST',{courseId:course.data.id,rating:5,comment:'Assessment test'},st.cookie)).status,201);
+assert.equal((await call('/chat/general','POST',{text:'Assessment test'},st.cookie)).status,201);
+const reg=await call('/auth/register','POST',{name:'Test Learner',email:'assessment@example.test',password:'testpassword',role:'student'});assert.equal(reg.status,201);assert.ok(reg.cookie);
+assert.equal((await call('/reset-demo','POST',{},a.cookie)).status,200);
+console.log('PASS: 16 authentication, authorisation, course, enrolment, progress, review, chat, registration and reset checks.');
